@@ -2,9 +2,15 @@
 
 namespace craftnet\composer;
 
+use Aws\CloudFront\CloudFrontClient;
+use Aws\CloudFront\Exception\CloudFrontException;
+use Aws\Credentials\Credentials;
+use Aws\Handler\GuzzleV6\GuzzleHandler;
+use Aws\Sts\StsClient;
 use Craft;
 use craft\db\Query;
 use craft\helpers\Console;
+use craft\helpers\DateTimeHelper;
 use craft\helpers\FileHelper;
 use craft\helpers\Json;
 use craftnet\composer\jobs\DeletePaths;
@@ -16,11 +22,29 @@ use yii\base\Component;
  */
 class JsonDumper extends Component
 {
+    // How long to cache AWS creds
+    const AWS_CREDENTIAL_CACHE_DURATION = 21600;
+
     /**
      * @var string The path that packages.json, etc., should be saved
      * @see dumpProviderJson()
      */
     public $composerWebroot;
+
+    /*
+     * @var null
+     */
+    public $cfDistributionId;
+
+    /**
+     *
+     */
+    public function init()
+    {
+        if ($id = (Craft::parseEnv('$CLOUDFRONT_COMPOSER_DISTRIBUTION_ID'))) {
+            $this->cfDistributionId = $id;
+        }
+    }
 
     /**
      * Dumps out packages.json, and all the provider JSON files.
@@ -189,11 +213,15 @@ class JsonDumper extends Component
             'provider-includes' => [
                 $indexPath => ['sha256' => $indexHash],
             ],
-            'providers-url' => "/p/%package%/%hash%.json",
+            'providers-url' => '/p/%package%/%hash%.json',
         ];
 
         Craft::info("Writing JSON file to {$this->composerWebroot}/packages.json", __METHOD__);
         FileHelper::writeToFile($this->composerWebroot . '/packages.json', Json::encode($rootData));
+
+        if ($this->cfDistributionId) {
+            $this->_invalidateCloudFrontPath('/packages.json');
+        }
 
         if ($isConsole) {
             Console::output('done');
@@ -204,6 +232,76 @@ class JsonDumper extends Component
                 'paths' => $oldPaths,
             ]));
         }
+    }
+
+    /**
+     * @param $path
+     * @return bool
+     */
+    private function _invalidateCloudFrontPath($path): bool
+    {
+        $client = $this->_getCloudFrontClient();
+
+        try {
+            $client->createInvalidation(
+                [
+                    'DistributionId' => Craft::parseEnv('$CLOUDFRONT_COMPOSER_DISTRIBUTION_ID'),
+                    'InvalidationBatch' => [
+                        'Paths' =>
+                            [
+                                'Quantity' => 1,
+                                'Items' => [$path]
+                            ],
+                        'CallerReference' => 'craftnet-'.DateTimeHelper::currentTimeStamp()
+                    ]
+                ]
+            );
+        } catch (CloudFrontException $exception) {
+            Craft::warning($exception->getMessage());
+        }
+
+        return true;
+    }
+
+    /**
+     * @return CloudFrontClient
+     */
+    private function _getCloudFrontClient(): CloudFrontClient
+    {
+        $awsKeyId = Craft::parseEnv('$AWS_ACCESS_KEY_ID');
+        $awsSecretKey = Craft::parseEnv('$AWS_SECRET_ACCESS_KEY');
+        $awsRegion = Craft::parseEnv('$REGION');
+
+        $config = [
+            'region' => $awsRegion,
+            'version' => 'latest'
+        ];
+
+        $client = Craft::createGuzzleClient();
+        $config['http_handler'] = new GuzzleHandler($client);
+        $tokenKey = 'craftnet.'.md5($awsKeyId.$awsSecretKey);
+
+        $credentials = new Credentials($awsKeyId, $awsSecretKey);
+
+        // See if they're cached first.
+        if (Craft::$app->cache->exists($tokenKey)) {
+            $cached = Craft::$app->cache->get($tokenKey);
+            $credentials->unserialize($cached);
+        } else {
+            $config['credentials'] = $credentials;
+            $stsClient = new StsClient($config);
+
+            // Cache for 6 hours
+            $result = $stsClient->getSessionToken(['DurationSeconds' => static::AWS_CREDENTIAL_CACHE_DURATION]);
+            $credentials = $stsClient->createCredentials($result);
+            $cacheDuration = $credentials->getExpiration() - time();
+            $cacheDuration = $cacheDuration > 0 ?: static::AWS_CREDENTIAL_CACHE_DURATION;
+            Craft::$app->cache->set($tokenKey, $credentials->serialize(), $cacheDuration);
+        }
+
+        $config['credentials'] = $credentials;
+
+        return new CloudFrontClient($config);
     }
 
     /**
@@ -219,7 +317,8 @@ class JsonDumper extends Component
     {
         $content = Json::encode($data);
         $hash = hash('sha256', $content);
-        $path = $this->composerWebroot . '/' . str_replace('%hash%', $hash, $path);
+        $relativePath = '/' . str_replace('%hash%', $hash, $path);
+        $path = $this->composerWebroot . $relativePath;
 
         // If nothing's changed, we're done
         if (file_exists($path)) {
@@ -238,10 +337,14 @@ class JsonDumper extends Component
             closedir($handle);
         }
 
-        Craft::info("Writing JSON file to " . $path, __METHOD__);
+        Craft::info('Writing JSON file to ' . $path, __METHOD__);
         try {
             // Write the new file
             FileHelper::writeToFile($path, $content);
+
+            if ($this->cfDistributionId) {
+                $this->_invalidateCloudFrontPath($relativePath);
+            }
         } catch (\Throwable $throwable) {
             Craft::error($throwable->getMessage(), __METHOD__);
         }
